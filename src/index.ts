@@ -1,5 +1,4 @@
 import { HttpError, saveStream } from "./storage";
-import { UI_HTML } from "./ui";
 
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024;
 
@@ -21,12 +20,6 @@ async function route(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	const { pathname } = url;
 	const method = request.method;
-
-	if (pathname === "/" && method === "GET") {
-		return new Response(UI_HTML, {
-			headers: { "content-type": "text/html; charset=utf-8" },
-		});
-	}
 
 	if (pathname === "/api/download" && method === "POST") {
 		await requireAuth(request, env);

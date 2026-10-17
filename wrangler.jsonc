@@ -4,6 +4,12 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
   "observability": { "enabled": true },
+  // The React UI (web/) is built by Vite and served as static assets.
+  // Only API and file routes reach the Worker code.
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/files/*"]
+  },
   "r2_buckets": [
     {
       "binding": "BUCKET",

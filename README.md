@@ -4,7 +4,8 @@ A Cloudflare Worker that takes a direct download link, downloads the file and
 saves it to an R2 bucket. The file is streamed straight into R2, so it never
 has to fit in the Worker's memory.
 
-- `GET /` – a small web page: paste a link, save it, see and delete saved files.
+- `/` – a web app (React + HeroUI + shadcn/ui + Lucide icons): paste a link,
+  save it, then filter, copy, download or delete saved files. Light and dark themes.
 - `POST /api/download` – save a link to the bucket (needs the token).
 - `GET /api/files` – list saved files (needs the token).
 - `DELETE /api/files/<key>` – delete a file (needs the token).
@@ -16,11 +17,12 @@ has to fit in the Worker's memory.
 npm install
 npx wrangler r2 bucket create krs-dl     # or change bucket_name in wrangler.jsonc
 npx wrangler secret put API_TOKEN        # pick a long random string
-npm run deploy
+npm run deploy                           # builds the UI, then deploys
 ```
 
 For local development, copy `.dev.vars.example` to `.dev.vars`, set a token,
-and run `npm run dev`. Local runs use a simulated R2 bucket.
+and run `npm run dev`. Vite serves the UI and runs the Worker in the same
+process (via `@cloudflare/vite-plugin`), with a simulated R2 bucket.
 
 ## API
 
@@ -75,10 +77,33 @@ limit, especially on the multipart path, which copies bytes in JavaScript.
 On the Workers Paid plan you can raise it with `limits.cpu_ms` in
 `wrangler.jsonc`.
 
+## Project layout
+
+| Path | What |
+| --- | --- |
+| `src/` | The Worker: API, R2 storage, file serving. |
+| `web/` | The React UI. Vite builds it into static assets served by the Worker. |
+| `web/components/ui/` | shadcn/ui components (table, alert dialog, skeleton, toasts). |
+| `test/` | Worker tests. |
+
+The UI mixes three libraries:
+
+- **HeroUI v3** – cards, buttons, text fields, search field, chips, tooltips, spinner, progress bar.
+- **shadcn/ui** – the files table, delete confirmation dialog, loading skeletons and Sonner toasts.
+- **Lucide** – all icons.
+
+HeroUI owns the colors. `web/index.css` maps the token names shadcn/ui
+expects (`primary`, `popover`, `muted-foreground`, …) onto HeroUI's palette,
+so both libraries follow the same light and dark theme. Add more shadcn
+components with `npx shadcn@latest add <name>`; if a new one uses `bg-muted`
+or `bg-accent` as a background, switch it to `bg-default`, since those names
+mean different things in HeroUI.
+
 ## Development
 
 ```sh
-npm test            # vitest inside the Workers runtime (Miniflare)
+npm run dev         # UI + Worker on http://localhost:5173
+npm test            # Worker tests inside the Workers runtime (Miniflare)
 npm run typecheck
 npm run cf-typegen  # regenerate worker-configuration.d.ts after editing wrangler.jsonc
 ```
