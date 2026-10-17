@@ -10,13 +10,18 @@ export const MAX_PARTS = 900;
 // While one part uploads the next one downloads, so two part buffers are in
 // memory. A Worker has 128 MB, so above this size upload one part at a time.
 const PIPELINE_MAX_PART = 40 * MIB;
-// Files with a known length up to this size go up in a single streamed put.
-// R2's single-put limit is just under 5 GiB.
+// Files over this size, from sources that support range requests, are fetched
+// one byte range at a time, each piped natively into one multipart part. That
+// keeps CPU time near zero and lets us report progress after each part.
+export const RANGED_MIN = 256 * MIB;
+// Otherwise, files with a known length up to this size go up in a single
+// streamed put. R2's single-put limit is just under 5 GiB.
 const SINGLE_PUT_MAX = 4 * 1024 * MIB;
-// Bigger files are fetched in byte ranges, one at a time, each piped natively
-// into one multipart part. The Free plan allows 50 fetch() calls per request,
-// so use at most 40 ranges and keep the rest for retries.
+// The Free plan allows 50 fetch() calls per request, so use at most 40 ranges
+// and keep the rest for retries. Ranges are at least 128 MiB because some
+// hosts throttle clients that make many requests per minute.
 const RANGED_MAX_PARTS = 40;
+const RANGED_MIN_PART = 128 * MIB;
 const RANGED_RETRIES = 8;
 
 export class HttpError extends Error {
@@ -39,6 +44,8 @@ export interface SaveOptions {
 	// Final URL of a source that advertised `Accept-Ranges: bytes`, else null.
 	rangeUrl: string | null;
 	fetchHeaders: Record<string, string>;
+	// Called with the number of bytes stored so far, after each part.
+	onProgress?: (bytes: number) => void;
 }
 
 export async function saveStream(bucket: R2Bucket, opts: SaveOptions): Promise<number> {
@@ -48,6 +55,10 @@ export async function saveStream(bucket: R2Bucket, opts: SaveOptions): Promise<n
 	}
 	const putOptions = { httpMetadata: opts.httpMetadata, customMetadata: opts.customMetadata };
 
+	if (opts.length !== null && opts.length > RANGED_MIN && opts.rangeUrl !== null) {
+		await opts.body.cancel();
+		return rangedUpload(bucket, opts.key, opts.rangeUrl, opts.length, opts.fetchHeaders, putOptions, opts.onProgress);
+	}
 	if (opts.length !== null && opts.length <= SINGLE_PUT_MAX) {
 		// R2 needs to know the length of a streamed body up front.
 		const { readable, writable } = new FixedLengthStream(opts.length);
@@ -57,15 +68,11 @@ export async function saveStream(bucket: R2Bucket, opts: SaveOptions): Promise<n
 		]);
 		return object.size;
 	}
-	if (opts.length !== null && opts.rangeUrl !== null) {
-		await opts.body.cancel();
-		return rangedUpload(bucket, opts.key, opts.rangeUrl, opts.length, opts.fetchHeaders, putOptions);
-	}
 	// Fallback for unknown sizes, or big files from sources without range
 	// support. Bytes pass through memory, which costs CPU time, so on the Free
 	// plan this only works up to a few hundred MB.
 	const partSize = opts.length === null ? PART_SIZE : partSizeFor(opts.length);
-	return multipartUpload(bucket, opts.key, opts.body, partSize, opts.maxBytes, putOptions);
+	return multipartUpload(bucket, opts.key, opts.body, partSize, opts.maxBytes, putOptions, opts.onProgress);
 }
 
 // Smallest part size (in whole MiB) that fits the file in MAX_PARTS parts.
@@ -75,7 +82,7 @@ export function partSizeFor(length: number): number {
 
 // Part size (in whole MiB) for ranged uploads; parts can be up to 5 GiB.
 export function rangedPartSize(length: number): number {
-	return Math.max(PART_SIZE, Math.ceil(length / RANGED_MAX_PARTS / MIB) * MIB);
+	return Math.max(RANGED_MIN_PART, Math.ceil(length / RANGED_MAX_PARTS / MIB) * MIB);
 }
 
 // Fetches the file one byte range at a time and pipes each response straight
@@ -87,8 +94,9 @@ export async function rangedUpload(
 	length: number,
 	fetchHeaders: Record<string, string>,
 	putOptions: R2MultipartOptions,
+	onProgress?: (bytes: number) => void,
+	partSize = rangedPartSize(length),
 ): Promise<number> {
-	const partSize = rangedPartSize(length);
 	if (partSize > 5 * 1024 * MIB) {
 		throw new HttpError(413, "File is too large for an R2 multipart upload");
 	}
@@ -102,6 +110,7 @@ export async function rangedUpload(
 			for (let attempt = 1; ; attempt++) {
 				try {
 					parts.push(await uploadRange(upload, parts.length + 1, url, start, end, fetchHeaders));
+					onProgress?.(end + 1);
 					break;
 				} catch (err) {
 					const { final, retryAfter } = err as { final?: boolean; retryAfter?: string | null };
@@ -143,11 +152,11 @@ async function uploadRange(
 	return part;
 }
 
-// Exponential backoff (1s, 2s, 4s, ... up to 10s), or the server's Retry-After.
+// Exponential backoff (2s, 4s, 8s, ... up to 30s), or the server's Retry-After.
 function backoffMs(attempt: number, retryAfter: string | null | undefined): number {
 	const seconds = Number(retryAfter);
-	if (retryAfter && Number.isFinite(seconds)) return Math.min(Math.max(seconds, 0), 10) * 1000;
-	return Math.min(1000 * 2 ** (attempt - 1), 10_000);
+	if (retryAfter && Number.isFinite(seconds)) return Math.min(Math.max(seconds, 0), 30) * 1000;
+	return Math.min(2000 * 2 ** (attempt - 1), 30_000);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -161,6 +170,7 @@ async function multipartUpload(
 	partSize: number,
 	maxBytes: number,
 	putOptions: R2MultipartOptions,
+	onProgress?: (bytes: number) => void,
 ): Promise<number> {
 	// An IdentityTransformStream gives a byte stream that supports
 	// readAtLeast(), which fills a whole part natively in one call. Copying
@@ -180,7 +190,10 @@ async function multipartUpload(
 			if (total > maxBytes) {
 				throw new HttpError(413, `File is larger than the ${maxBytes} byte limit`);
 			}
-			if (inFlight) parts.push(await inFlight);
+			if (inFlight) {
+				parts.push(await inFlight);
+				onProgress?.(total - chunk.byteLength);
+			}
 			if (parts.length >= MAX_PARTS) {
 				throw new HttpError(413, "File is too large to upload in one request");
 			}
@@ -191,6 +204,7 @@ async function multipartUpload(
 			if (!pipeline) {
 				parts.push(await inFlight);
 				inFlight = null;
+				onProgress?.(total);
 			}
 			if (chunk.byteLength < partSize) break;
 		}

@@ -1,4 +1,4 @@
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker, { filenameFromDisposition, sanitizeFilename } from "../src/index";
 import { MAX_PARTS, PART_SIZE, partSizeFor, rangedPartSize, rangedUpload } from "../src/storage";
@@ -10,7 +10,16 @@ const realFetch = globalThis.fetch;
 type IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
 async function call(path: string, init: RequestInit = {}): Promise<Response> {
-	return worker.fetch(new Request(`https://dl.example${path}`, init) as IncomingRequest, env);
+	const ctx = createExecutionContext();
+	const res = await worker.fetch(new Request(`https://dl.example${path}`, init) as IncomingRequest, env, ctx);
+	if (res.headers.get("content-type") === "application/x-ndjson") {
+		// Read the stream fully before the context is torn down.
+		const text = await res.text();
+		await waitOnExecutionContext(ctx);
+		return new Response(text, { headers: res.headers });
+	}
+	await waitOnExecutionContext(ctx);
+	return res;
 }
 
 // Routes the worker's outbound fetch to `handler` instead of the network.
@@ -130,6 +139,31 @@ describe("POST /api/download", () => {
 		expect(bytes[total - 1]).toBe((total - 1) % 251);
 	});
 
+	it("streams progress and the saved file as NDJSON when asked", async () => {
+		mockUpstream(() => new Response(chunkedStream(PART_SIZE + 10)));
+		const res = await call("/api/download", {
+			method: "POST",
+			headers: { ...AUTH, "content-type": "application/json", accept: "application/x-ndjson" },
+			body: JSON.stringify({ url: "https://files.example/stream.bin" }),
+		});
+		expect(res.headers.get("content-type")).toBe("application/x-ndjson");
+		const events = (await res.text()).trim().split("\n").map((line) => JSON.parse(line));
+		expect(events[0]).toMatchObject({ type: "progress", bytes: 0, total: null });
+		expect(events.some((e) => e.type === "progress" && e.bytes === PART_SIZE)).toBe(true);
+		expect(events.at(-1)).toMatchObject({ type: "done", file: { filename: "stream.bin", size: PART_SIZE + 10 } });
+	});
+
+	it("reports errors inside the NDJSON stream", async () => {
+		mockUpstream(() => new Response("x", { headers: { "content-length": String(100 * 1024 ** 3) } }));
+		const res = await call("/api/download", {
+			method: "POST",
+			headers: { ...AUTH, "content-type": "application/json", accept: "application/x-ndjson" },
+			body: JSON.stringify({ url: "https://files.example/huge.iso" }),
+		});
+		const events = (await res.text()).trim().split("\n").map((line) => JSON.parse(line));
+		expect(events.at(-1)).toMatchObject({ type: "error", status: 413 });
+	});
+
 	it("uploads ranged parts one at a time and retries throttled ones", async () => {
 		const total = PART_SIZE * 2 + 777;
 		let throttled = false;
@@ -141,8 +175,19 @@ describe("POST /api/download", () => {
 				}
 			}),
 		);
-		const size = await rangedUpload(env.BUCKET, "ranged/file.bin", "https://files.example/big", total, {}, {});
+		const progress: number[] = [];
+		const size = await rangedUpload(
+			env.BUCKET,
+			"ranged/file.bin",
+			"https://files.example/big",
+			total,
+			{},
+			{},
+			(n) => progress.push(n),
+			PART_SIZE,
+		);
 		expect(size).toBe(total);
+		expect(progress).toEqual([PART_SIZE, PART_SIZE * 2, total]);
 		expect(throttled).toBe(true);
 		expect(fetchSpy).toHaveBeenCalledTimes(4);
 		const bytes = new Uint8Array(await (await env.BUCKET.get("ranged/file.bin"))!.arrayBuffer());
@@ -155,7 +200,7 @@ describe("POST /api/download", () => {
 		const total = PART_SIZE + 1;
 		mockUpstream(rangeSource(total, () => new Response("whole file")));
 		await expect(
-			rangedUpload(env.BUCKET, "ranged/liar.bin", "https://files.example/big", total, {}, {}),
+			rangedUpload(env.BUCKET, "ranged/liar.bin", "https://files.example/big", total, {}, {}, undefined, PART_SIZE),
 		).rejects.toThrow("Source answered a range request with HTTP 200");
 		expect(await env.BUCKET.get("ranged/liar.bin")).toBeNull();
 	});
@@ -164,6 +209,8 @@ describe("POST /api/download", () => {
 		const user = 8_376_320_000;
 		expect(Math.ceil(user / rangedPartSize(user))).toBeLessThanOrEqual(40);
 		expect(rangedPartSize(50 * 1024 ** 3)).toBeLessThanOrEqual(5 * 1024 ** 3);
+		// Few, large ranges so hosts that limit requests per minute don't throttle us.
+		expect(Math.ceil(1024 ** 3 / rangedPartSize(1024 ** 3))).toBe(8);
 		for (const size of [8_376_320_000, 50 * 1024 ** 3]) {
 			const partSize = partSizeFor(size);
 			expect(Math.ceil(size / partSize)).toBeLessThanOrEqual(MAX_PARTS);

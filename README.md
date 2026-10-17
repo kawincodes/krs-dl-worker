@@ -56,6 +56,31 @@ Errors come back as `{"error": "..."}` with `400` (bad input), `401` (bad
 token), `413` (file too large) or `502` (the source failed or returned a
 non-2xx status).
 
+### Progress for large files
+
+Big files can take many minutes, and a request that sends nothing for that
+long can be cut off by proxies. Add `Accept: application/x-ndjson` to get one
+JSON object per line while the file is saved (the web UI does this):
+
+```sh
+curl -N -X POST https://<your-worker>/api/download \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/x-ndjson" \
+  -d '{"url": "https://example.com/big.iso"}'
+```
+
+```json
+{"type":"progress","bytes":0,"total":8376320000,"elapsed":0}
+{"type":"progress","bytes":209715200,"total":8376320000,"elapsed":9}
+…
+{"type":"done","file":{"key":"…","filename":"big.iso","size":8376320000,…}}
+```
+
+A `progress` event is sent after each part and at least every 10 seconds.
+`total` is `null` when the source doesn't say how big the file is. Errors that
+happen after streaming starts arrive as `{"type":"error","status":…,"error":"…"}`.
+
 ## Configuration
 
 | Name | Where | Default | Meaning |
@@ -69,20 +94,21 @@ non-2xx status).
 The Workers Free plan allows only 10 ms of CPU time per request, so the Worker
 avoids touching file bytes in JavaScript wherever it can:
 
-- **Up to 4 GiB with a known size:** the download is piped straight into a
-  single R2 `put`.
-- **Over 4 GiB:** if the source supports range requests (`Accept-Ranges:
-  bytes`, which most download servers do), the file is fetched one range at a
-  time, at most 40 ranges, and each response is piped straight into an R2
-  multipart part. Throttled (429) or failed (5xx) ranges are retried with
-  backoff.
+- **Up to 4 GiB with a known size (and smaller files):** the download is
+  piped straight into a single R2 `put`.
+- **Over 256 MiB, from a source that supports range requests**
+  (`Accept-Ranges: bytes`, which most download servers do): the file is
+  fetched one range at a time, in at most 40 ranges of at least 128 MiB, and
+  each response is piped straight into an R2 multipart part. This also
+  allows progress updates. Throttled (429) or failed (5xx) ranges are retried
+  with backoff.
 - **Unknown size, or over 4 GiB without range support:** bytes are buffered
   into 16 MiB+ parts. This costs CPU time, so on the Free plan it only works
   for files up to a few hundred MB. The Workers Paid plan raises the limit.
 
 Downloads use one connection at a time, like a browser. The `POST` request stays
 open until the file is stored, so the caller has to wait. Speed depends on the
-source: a 1 GiB file from Hetzner took about a minute.
+source: a 1 GiB file from Hetzner took about 36 seconds.
 
 ## Project layout
 

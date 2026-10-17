@@ -3,9 +3,9 @@ import { HttpError, saveStream } from "./storage";
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024;
 
 export default {
-	async fetch(request, env): Promise<Response> {
+	async fetch(request, env, ctx): Promise<Response> {
 		try {
-			return await route(request, env);
+			return await route(request, env, ctx);
 		} catch (err) {
 			if (err instanceof HttpError) {
 				return json({ error: err.message }, err.status);
@@ -16,14 +16,14 @@ export default {
 	},
 } satisfies ExportedHandler<Env>;
 
-async function route(request: Request, env: Env): Promise<Response> {
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const url = new URL(request.url);
 	const { pathname } = url;
 	const method = request.method;
 
 	if (pathname === "/api/download" && method === "POST") {
 		await requireAuth(request, env);
-		return handleDownload(request, env, url.origin);
+		return handleDownload(request, env, ctx, url.origin);
 	}
 
 	if (pathname === "/api/files" && method === "GET") {
@@ -48,7 +48,12 @@ async function route(request: Request, env: Env): Promise<Response> {
 	throw new HttpError(404, "Not found");
 }
 
-async function handleDownload(request: Request, env: Env, origin: string): Promise<Response> {
+async function handleDownload(
+	request: Request,
+	env: Env,
+	ctx: ExecutionContext,
+	origin: string,
+): Promise<Response> {
 	let input: { url?: unknown; filename?: unknown };
 	try {
 		input = await request.json();
@@ -88,31 +93,72 @@ async function handleDownload(request: Request, env: Env, origin: string): Promi
 	const key = `${crypto.randomUUID()}/${filename}`;
 	const contentType = upstream.headers.get("content-type") || "application/octet-stream";
 
-	const size = await saveStream(env.BUCKET, {
-		key,
-		body: upstream.body,
-		length: knownLength(upstream.headers),
-		maxBytes: maxBytes(env),
-		rangeUrl: acceptsRanges(upstream.headers) ? upstream.url || source.toString() : null,
-		fetchHeaders,
-		httpMetadata: {
-			contentType,
-			contentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
-		},
-		customMetadata: { sourceUrl: source.toString() },
-	});
-
-	return json(
-		{
+	const length = knownLength(upstream.headers);
+	const body = upstream.body;
+	const save = async (onProgress?: (bytes: number) => void) => {
+		const size = await saveStream(env.BUCKET, {
 			key,
-			filename,
-			size,
-			contentType,
-			sourceUrl: source.toString(),
-			downloadUrl: fileUrl(origin, key),
-		},
-		201,
-	);
+			body,
+			length,
+			maxBytes: maxBytes(env),
+			rangeUrl: acceptsRanges(upstream.headers) ? upstream.url || source.toString() : null,
+			fetchHeaders,
+			onProgress,
+			httpMetadata: {
+				contentType,
+				contentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+			},
+			customMetadata: { sourceUrl: source.toString() },
+		});
+		return { key, filename, size, contentType, sourceUrl: source.toString(), downloadUrl: fileUrl(origin, key) };
+	};
+
+	if ((request.headers.get("accept") ?? "").includes("application/x-ndjson")) {
+		return streamProgress(ctx, length, save);
+	}
+	return json(await save(), 201);
+}
+
+// Streams newline-delimited JSON while the file is saved: `progress` events
+// (after each part, and every 10 seconds so the connection never goes idle),
+// then one `done` event with the file or one `error` event.
+function streamProgress(
+	ctx: ExecutionContext,
+	total: number | null,
+	save: (onProgress: (bytes: number) => void) => Promise<unknown>,
+): Response {
+	const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+	const writer = writable.getWriter();
+	const encoder = new TextEncoder();
+	const started = Date.now();
+	let bytes = 0;
+
+	const send = (event: Record<string, unknown>) =>
+		writer.write(encoder.encode(`${JSON.stringify(event)}\n`)).catch(() => {});
+	const progress = () =>
+		send({ type: "progress", bytes, total, elapsed: Math.round((Date.now() - started) / 1000) });
+
+	void progress();
+	const heartbeat = setInterval(progress, 10_000);
+	const job = save((stored) => {
+		bytes = stored;
+		void progress();
+	})
+		.then((file) => send({ type: "done", file }))
+		.catch((err) => {
+			if (!(err instanceof HttpError)) console.error(err);
+			const status = err instanceof HttpError ? err.status : 500;
+			return send({ type: "error", status, error: err instanceof HttpError ? err.message : "Internal error" });
+		})
+		.finally(async () => {
+			clearInterval(heartbeat);
+			await writer.close().catch(() => {});
+		});
+	ctx.waitUntil(job);
+
+	return new Response(readable, {
+		headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
+	});
 }
 
 async function handleList(env: Env, url: URL): Promise<Response> {

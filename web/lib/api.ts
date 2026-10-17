@@ -35,12 +35,56 @@ async function request<T>(token: string, path: string, init: RequestInit = {}): 
 	return data as T;
 }
 
-export function saveLink(token: string, url: string, filename?: string) {
-	return request<SavedFile>(token, "/api/download", {
+export interface SaveProgress {
+	bytes: number;
+	total: number | null;
+	elapsed: number;
+}
+
+type SaveEvent =
+	| ({ type: "progress" } & SaveProgress)
+	| { type: "done"; file: SavedFile }
+	| { type: "error"; status: number; error: string };
+
+// Asks for a stream of progress events so long downloads show progress and
+// the connection never sits idle.
+export async function saveLink(
+	token: string,
+	url: string,
+	filename: string | undefined,
+	onProgress: (progress: SaveProgress) => void,
+): Promise<SavedFile> {
+	const res = await fetch("/api/download", {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: {
+			authorization: `Bearer ${token}`,
+			"content-type": "application/json",
+			accept: "application/x-ndjson",
+		},
 		body: JSON.stringify(filename ? { url, filename } : { url }),
 	});
+	if (!res.ok || !res.body) {
+		const data = await res.json().catch(() => ({}));
+		throw new ApiError(res.status, data.error || `HTTP ${res.status}`);
+	}
+
+	const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+	let buffered = "";
+	for (;;) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		buffered += value;
+		const lines = buffered.split("\n");
+		buffered = lines.pop() ?? "";
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			const event = JSON.parse(line) as SaveEvent;
+			if (event.type === "progress") onProgress(event);
+			else if (event.type === "done") return event.file;
+			else throw new ApiError(event.status, event.error);
+		}
+	}
+	throw new ApiError(502, "The connection closed before the file was saved");
 }
 
 export function listFiles(token: string, cursor?: string | null) {

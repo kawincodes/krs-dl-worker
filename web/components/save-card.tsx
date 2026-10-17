@@ -2,7 +2,7 @@ import { Button, Card, Description, InputGroup, Label, ProgressBar, Spinner, Tex
 import { Check, ClipboardPaste, CloudUpload, Copy, Download, FileText, Link2, PartyPopper } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-import { type SavedFile, formatBytes, saveLink } from "@/lib/api";
+import { type SaveProgress, type SavedFile, formatBytes, saveLink } from "@/lib/api";
 import { FileIcon } from "./file-icon";
 
 interface Props {
@@ -15,14 +15,16 @@ export function SaveCard({ token, onSaved, onError }: Props) {
 	const [url, setUrl] = useState("");
 	const [filename, setFilename] = useState("");
 	const [saving, setSaving] = useState(false);
+	const [progress, setProgress] = useState<SaveProgress | null>(null);
 	const [result, setResult] = useState<SavedFile | null>(null);
 
 	async function submit(e: React.FormEvent) {
 		e.preventDefault();
 		setSaving(true);
 		setResult(null);
+		setProgress(null);
 		try {
-			const saved = await saveLink(token, url.trim(), filename.trim() || undefined);
+			const saved = await saveLink(token, url.trim(), filename.trim() || undefined, setProgress);
 			setResult(saved);
 			setUrl("");
 			setFilename("");
@@ -93,21 +95,51 @@ export function SaveCard({ token, onSaved, onError }: Props) {
 					</Button>
 				</form>
 
-				{saving && (
-					<div className="mt-4 flex flex-col gap-2">
-						<ProgressBar isIndeterminate aria-label="Downloading" size="sm">
-							<ProgressBar.Track>
-								<ProgressBar.Fill />
-							</ProgressBar.Track>
-						</ProgressBar>
-						<p className="text-xs text-muted">Large files can take several minutes. Keep this tab open.</p>
-					</div>
-				)}
+				{saving && <SaveStatus progress={progress} />}
 
 				{result && !saving && <SavedPanel file={result} />}
 			</Card.Content>
 		</Card>
 	);
+}
+
+function SaveStatus({ progress }: { progress: SaveProgress | null }) {
+	const total = progress?.total ?? null;
+	const bytes = progress?.bytes ?? 0;
+	const percent = total ? Math.min(100, (bytes / total) * 100) : null;
+	const elapsed = progress?.elapsed ?? 0;
+
+	return (
+		<div className="mt-4 flex flex-col gap-2">
+			<ProgressBar
+				aria-label="Saving to R2"
+				size="sm"
+				isIndeterminate={percent === null || bytes === 0}
+				value={percent ?? undefined}
+			>
+				<ProgressBar.Track>
+					<ProgressBar.Fill />
+				</ProgressBar.Track>
+			</ProgressBar>
+			<div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted tabular-nums">
+				<span>
+					{total ? `${formatBytes(bytes)} of ${formatBytes(total)}` : bytes ? `${formatBytes(bytes)} saved` : "Starting…"}
+					{percent !== null && bytes > 0 && ` · ${Math.floor(percent)}%`}
+				</span>
+				<span>
+					{formatDuration(elapsed)}
+					{elapsed > 0 && bytes > 0 && ` · ${formatBytes(bytes / elapsed)}/s`}
+				</span>
+			</div>
+			<p className="text-xs text-muted">Large files can take several minutes. Keep this tab open.</p>
+		</div>
+	);
+}
+
+function formatDuration(seconds: number) {
+	const m = Math.floor(seconds / 60);
+	const s = seconds % 60;
+	return m ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
 }
 
 function SavedPanel({ file }: { file: SavedFile }) {
