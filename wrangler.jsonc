@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "krs-dl-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "krs-dl"
+    }
+  ],
+  "vars": {
+    // Largest file (in bytes) the worker will accept. Default: 5 GiB.
+    "MAX_FILE_BYTES": "5368709120",
+    // "true" lets anyone with a /files/<key> link download it.
+    // "false" requires the API token for downloads too.
+    "PUBLIC_DOWNLOADS": "true"
+  }
+  // Secret, set with `npx wrangler secret put API_TOKEN`:
+  //   API_TOKEN - bearer token required to save, list and delete files.
+}
