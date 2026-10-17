@@ -94,11 +94,14 @@ export function SaveCard({ token, onSaved, onError }: Props) {
 				</form>
 
 				{saving && (
-					<ProgressBar isIndeterminate aria-label="Downloading" size="sm" className="mt-4">
-						<ProgressBar.Track>
-							<ProgressBar.Fill />
-						</ProgressBar.Track>
-					</ProgressBar>
+					<div className="mt-4 flex flex-col gap-2">
+						<ProgressBar isIndeterminate aria-label="Downloading" size="sm">
+							<ProgressBar.Track>
+								<ProgressBar.Fill />
+							</ProgressBar.Track>
+						</ProgressBar>
+						<p className="text-xs text-muted">Large files can take several minutes. Keep this tab open.</p>
+					</div>
 				)}
 
 				{result && !saving && <SavedPanel file={result} />}

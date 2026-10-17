@@ -68,12 +68,10 @@ async function handleDownload(request: Request, env: Env, origin: string): Promi
 		throw new HttpError(400, "Only http and https links are supported");
 	}
 
+	const fetchHeaders = { "user-agent": "krs-dl-worker/1.0" };
 	let upstream: Response;
 	try {
-		upstream = await fetch(source.toString(), {
-			redirect: "follow",
-			headers: { "user-agent": "krs-dl-worker/1.0" },
-		});
+		upstream = await fetch(source.toString(), { redirect: "follow", headers: fetchHeaders });
 	} catch (err) {
 		throw new HttpError(502, `Could not reach ${source.host}: ${String(err)}`);
 	}
@@ -95,6 +93,8 @@ async function handleDownload(request: Request, env: Env, origin: string): Promi
 		body: upstream.body,
 		length: knownLength(upstream.headers),
 		maxBytes: maxBytes(env),
+		rangeUrl: acceptsRanges(upstream.headers) ? upstream.url || source.toString() : null,
+		fetchHeaders,
 		httpMetadata: {
 			contentType,
 			contentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
@@ -214,6 +214,10 @@ function knownLength(headers: Headers): number | null {
 	const value = headers.get("content-length");
 	if (value === null || !/^\d+$/.test(value)) return null;
 	return Number(value);
+}
+
+function acceptsRanges(headers: Headers): boolean {
+	return headers.get("accept-ranges")?.toLowerCase() === "bytes";
 }
 
 function maxBytes(env: Env): number {

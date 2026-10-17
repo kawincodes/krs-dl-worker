@@ -17,8 +17,8 @@
     }
   ],
   "vars": {
-    // Largest file (in bytes) the worker will accept. Default: 5 GiB.
-    "MAX_FILE_BYTES": "5368709120",
+    // Largest file (in bytes) the worker will accept: 50 GiB.
+    "MAX_FILE_BYTES": "53687091200",
     // "true" lets anyone with a /files/<key> link download it.
     // "false" requires the API token for downloads too.
     "PUBLIC_DOWNLOADS": "true"

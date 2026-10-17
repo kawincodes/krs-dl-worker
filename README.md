@@ -61,21 +61,28 @@ non-2xx status).
 | Name | Where | Default | Meaning |
 | --- | --- | --- | --- |
 | `API_TOKEN` | secret | – | Required. Requests without it are refused. |
-| `MAX_FILE_BYTES` | `vars` | `5368709120` (5 GiB) | Largest file accepted. |
+| `MAX_FILE_BYTES` | `vars` | `53687091200` (50 GiB) | Largest file accepted. |
 | `PUBLIC_DOWNLOADS` | `vars` | `"true"` | `"true"`: anyone with a `/files/…` link can download it (links contain a random UUID). `"false"`: downloads need the token too. |
 
 ## How large files are handled
 
-- If the source sends a `Content-Length` (and no compression), the body is
-  piped into a single R2 `put`.
-- Otherwise, or above 4 GiB, the Worker uses an R2 multipart upload with
-  10 MiB parts, up to roughly 97 GiB.
+The Workers Free plan allows only 10 ms of CPU time per request, so the Worker
+avoids touching file bytes in JavaScript wherever it can:
 
-The download runs while the `POST` request is open, so the caller has to wait
-until the file is stored. Very large files can run into the Workers CPU-time
-limit, especially on the multipart path, which copies bytes in JavaScript.
-On the Workers Paid plan you can raise it with `limits.cpu_ms` in
-`wrangler.jsonc`.
+- **Up to 4 GiB with a known size:** the download is piped straight into a
+  single R2 `put`.
+- **Over 4 GiB:** if the source supports range requests (`Accept-Ranges:
+  bytes`, which most download servers do), the file is fetched one range at a
+  time, at most 40 ranges, and each response is piped straight into an R2
+  multipart part. Throttled (429) or failed (5xx) ranges are retried with
+  backoff.
+- **Unknown size, or over 4 GiB without range support:** bytes are buffered
+  into 16 MiB+ parts. This costs CPU time, so on the Free plan it only works
+  for files up to a few hundred MB. The Workers Paid plan raises the limit.
+
+Downloads use one connection at a time, like a browser. The `POST` request stays
+open until the file is stored, so the caller has to wait. Speed depends on the
+source: a 1 GiB file from Hetzner took about a minute.
 
 ## Project layout
 

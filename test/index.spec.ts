@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker, { filenameFromDisposition, sanitizeFilename } from "../src/index";
-import { PART_SIZE } from "../src/storage";
+import { MAX_PARTS, PART_SIZE, partSizeFor, rangedPartSize, rangedUpload } from "../src/storage";
 
 const AUTH = { authorization: "Bearer test-token" };
 const realFetch = globalThis.fetch;
@@ -14,11 +14,28 @@ async function call(path: string, init: RequestInit = {}): Promise<Response> {
 }
 
 // Routes the worker's outbound fetch to `handler` instead of the network.
-function mockUpstream(handler: (url: string) => Response) {
-	return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+function mockUpstream(handler: (url: string, headers: Headers) => Response) {
+	return vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
 		const url = input instanceof Request ? input.url : String(input);
-		return handler(url);
+		const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
+		return handler(url, headers);
 	});
+}
+
+// Serves `Range: bytes=a-b` requests for a file whose byte i is i % 251.
+// `override` can replace the response for the range starting at a given byte.
+function rangeSource(total: number, override?: (start: number) => Response | undefined) {
+	return (_url: string, headers: Headers) => {
+		const match = /^bytes=(\d+)-(\d+)$/.exec(headers.get("range") ?? "");
+		if (!match) return new Response("expected a range request", { status: 400 });
+		const start = Number(match[1]);
+		const end = Number(match[2]);
+		const replaced = override?.(start);
+		if (replaced) return replaced;
+		const bytes = new Uint8Array(end - start + 1);
+		for (let i = 0; i < bytes.length; i++) bytes[i] = (start + i) % 251;
+		return new Response(bytes, { status: 206, headers: { "content-range": `bytes ${start}-${end}/${total}` } });
+	};
 }
 
 function save(body: unknown) {
@@ -102,6 +119,59 @@ describe("POST /api/download", () => {
 		expect(bytes[total - 1]).toBe((total - 1) % 251);
 	});
 
+	it("handles a source that sends many tiny chunks", async () => {
+		const total = PART_SIZE + 999;
+		mockUpstream(() => new Response(chunkedStream(total, 4096)));
+		const res = await save({ url: "https://files.example/tiny-chunks.bin" });
+		expect(res.status).toBe(201);
+		const bytes = new Uint8Array(await (await env.BUCKET.get((await res.json<{ key: string }>()).key))!.arrayBuffer());
+		expect(bytes.length).toBe(total);
+		expect(bytes[PART_SIZE]).toBe(PART_SIZE % 251);
+		expect(bytes[total - 1]).toBe((total - 1) % 251);
+	});
+
+	it("uploads ranged parts one at a time and retries throttled ones", async () => {
+		const total = PART_SIZE * 2 + 777;
+		let throttled = false;
+		const fetchSpy = mockUpstream(
+			rangeSource(total, (start) => {
+				if (start === PART_SIZE && !throttled) {
+					throttled = true;
+					return new Response("slow down", { status: 429, headers: { "retry-after": "0" } });
+				}
+			}),
+		);
+		const size = await rangedUpload(env.BUCKET, "ranged/file.bin", "https://files.example/big", total, {}, {});
+		expect(size).toBe(total);
+		expect(throttled).toBe(true);
+		expect(fetchSpy).toHaveBeenCalledTimes(4);
+		const bytes = new Uint8Array(await (await env.BUCKET.get("ranged/file.bin"))!.arrayBuffer());
+		expect(bytes.length).toBe(total);
+		expect(bytes[PART_SIZE + 5]).toBe((PART_SIZE + 5) % 251);
+		expect(bytes[total - 1]).toBe((total - 1) % 251);
+	});
+
+	it("stops when the source ignores range requests", async () => {
+		const total = PART_SIZE + 1;
+		mockUpstream(rangeSource(total, () => new Response("whole file")));
+		await expect(
+			rangedUpload(env.BUCKET, "ranged/liar.bin", "https://files.example/big", total, {}, {}),
+		).rejects.toThrow("Source answered a range request with HTTP 200");
+		expect(await env.BUCKET.get("ranged/liar.bin")).toBeNull();
+	});
+
+	it("sizes parts so large files fit in one request", () => {
+		const user = 8_376_320_000;
+		expect(Math.ceil(user / rangedPartSize(user))).toBeLessThanOrEqual(40);
+		expect(rangedPartSize(50 * 1024 ** 3)).toBeLessThanOrEqual(5 * 1024 ** 3);
+		for (const size of [8_376_320_000, 50 * 1024 ** 3]) {
+			const partSize = partSizeFor(size);
+			expect(Math.ceil(size / partSize)).toBeLessThanOrEqual(MAX_PARTS);
+			expect(partSize % (1024 * 1024)).toBe(0);
+		}
+		expect(partSizeFor(1)).toBe(PART_SIZE);
+	});
+
 	it("prefers the filename from the request, then Content-Disposition", async () => {
 		mockUpstream(
 			() =>
@@ -119,7 +189,7 @@ describe("POST /api/download", () => {
 	});
 
 	it("refuses files above MAX_FILE_BYTES", async () => {
-		mockUpstream(() => new Response("x", { headers: { "content-length": String(10 * 1024 ** 4) } }));
+		mockUpstream(() => new Response("x", { headers: { "content-length": String(100 * 1024 ** 3) } }));
 		const res = await save({ url: "https://files.example/huge.iso" });
 		expect(res.status).toBe(413);
 	});
